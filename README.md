@@ -89,6 +89,11 @@ The --fingerprint mode classifies each antenna violation by:
 
 ---
 
+## Sample snippet
+<img width="1644" height="1220" alt="Screenshot 2026-09-16 133856" src="https://github.com/user-attachments/assets/ee61b2b1-6587-444c-8b93-b58b140438c1" />
+
+
+
 ## Roadmap (v2)
 
 - Multi-corner timing (min / typical / max)
@@ -102,6 +107,5 @@ The --fingerprint mode classifies each antenna violation by:
 ---
 
 ## Author
-
-Sreehari — VLSI engineer with a passion for building tools that make the design flow less painful.
-Built to solve a real workflow pain: comparing 10+ OpenLane runs without reading reports manually.
+Sreehari - fellow VLSI engineer
+Purpose of this tool is that I got tired of jumping between different OpenLane run paths and manually comparing report values. What started as “I’m too lazy to type these paths again” turned into pd_compare.
