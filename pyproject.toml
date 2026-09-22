@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pd_compare"
+version = "1.0.0"
+description = "CLI tool for comparing OpenLane physical design runs"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Sreehari", github = "Sreehari2311" }
+]
+keywords = ["vlsi", "openlane", "physical-design", "eda", "sky130", "asic"]
+requires-python = ">=3.8"
+
+[project.scripts]
+pd_compare = "pd_compare:main"
+
+[project.urls]
+Homepage = "https://github.com/Sreehari2311/pd_compare"
