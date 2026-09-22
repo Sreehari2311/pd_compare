@@ -107,5 +107,6 @@ The --fingerprint mode classifies each antenna violation by:
 ---
 
 ## Author
-Sreehari - fellow VLSI engineer
-Purpose of this tool is that I got tired of jumping between different OpenLane run paths and manually comparing report values. What started as “I’m too lazy to type these paths again” turned into pd_compare.
+Sreehari — fellow VLSI engineer.
+
+I built pd_compare out of a small annoyance: comparing OpenLane runs meant repeatedly jumping between directories and digging through reports. I thought, “Why am I still doing this manually?” So I built a tool that does the comparison for me.
