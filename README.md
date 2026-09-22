@@ -91,6 +91,8 @@ The --fingerprint mode classifies each antenna violation by:
 
 ## Sample snippet
 <img width="1644" height="1220" alt="Screenshot 2026-09-16 133856" src="https://github.com/user-attachments/assets/ee61b2b1-6587-444c-8b93-b58b140438c1" />
+<img width="2797" height="749" alt="image" src="https://github.com/user-attachments/assets/b8ce8e41-6b4a-4392-9425-211cc28459b5" />
+
 
 
 
