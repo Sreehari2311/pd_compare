@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""pd_compare v2.0 — OpenLane run comparison tool with config diff"""
+"""pd_compare v3.0 — OpenLane run comparison tool
+  2 runs  → side-by-side diff with deltas  (v2 behaviour)
+  3-5 runs → parametric sweep table, no deltas
+"""
 
 import re
 import sys
@@ -17,7 +20,7 @@ RST= "\033[0m";  MAG= "\033[95m"
 # ── OutputWriter ─────────────────────────────────────────────────────────────
 class OutputWriter:
     def __init__(self, save: bool, fname: str):
-        self.save = save
+        self.save  = save
         self.fname = fname
         self.buf   = StringIO() if save else None
 
@@ -53,16 +56,15 @@ def _fmt_runtime(s: str) -> str:
     return s or "N/A"
 
 def _safe_float(v, default=None):
-    try:
-        return float(v)
-    except Exception:
-        return default
+    try:    return float(v)
+    except: return default
 
 def _safe_int(v, default=None):
-    try:
-        return int(float(v))
-    except Exception:
-        return default
+    try:    return int(float(v))
+    except: return default
+
+def _strip_ansi(s):
+    return re.sub(r'\x1b\[[0-9;]*m', '', s)
 
 # ── parse config_in.tcl ──────────────────────────────────────────────────────
 SKIP_INFRA = {
@@ -179,17 +181,12 @@ def collect_run_data(run_dir: Path) -> dict:
         sta_sum = _glob1(str(sign_dir / "*sta.summary.rpt"))
     if sta_sum:
         txt = _read(sta_sum)
-        lines = txt.splitlines()
         context = None
-        for line in lines:
-            if 'report_worst_slack' in line and '-max' in line:
-                context = 'setup'
-            elif 'report_worst_slack' in line and '-min' in line:
-                context = 'hold'
-            elif 'report_wns' in line:
-                context = 'wns'
-            elif 'report_tns' in line:
-                context = 'tns'
+        for line in txt.splitlines():
+            if 'report_worst_slack' in line and '-max' in line: context = 'setup'
+            elif 'report_worst_slack' in line and '-min' in line: context = 'hold'
+            elif 'report_wns' in line: context = 'wns'
+            elif 'report_tns' in line: context = 'tns'
             m = re.search(r'worst slack\s+(-?[\d.]+)', line)
             if m:
                 val = float(m.group(1))
@@ -201,7 +198,7 @@ def collect_run_data(run_dir: Path) -> dict:
             m3 = re.search(r'^tns\s+(-?[\d.]+)', line)
             if m3: d['tns'] = float(m3.group(1))
 
-    # MCMM corners → min / max / nom
+    # MCMM corners
     def _parse_corner_summary(path):
         if not path: return {}
         txt = _read(path); ctx = None; res = {}
@@ -260,7 +257,6 @@ def collect_run_data(run_dir: Path) -> dict:
         m = re.search(r'max fanout violation count\s+(\d+)', txt, re.I)
         d['fanout_viol'] = int(m.group(1)) if m else 0
 
-        # per-pin fanout data for fingerprinting
         fanout_pins = {}
         in_fo_section = False
         for line in txt.splitlines():
@@ -303,109 +299,33 @@ def collect_run_data(run_dir: Path) -> dict:
 
     return d
 
-# ── config diff display ───────────────────────────────────────────────────────
-def print_config_diff(w, run_a: str, run_b: str,
-                      path_a: Path, path_b: Path):
-    cfg_a = parse_config(path_a)
-    cfg_b = parse_config(path_b)
+# ══════════════════════════════════════════════════════════════════════════════
+# v2 — 2-run side-by-side with deltas
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if not cfg_a and not cfg_b:
-        return  # no config_in.tcl in either run, skip silently
-
-    changed, added, removed = diff_configs(cfg_a, cfg_b)
-    total_changes = len(changed) + len(added) + len(removed)
-
-    w.p(f"\n  {B}-- CONFIG CHANGES{RST}  "
-        f"{DIM}(config_in.tcl: {run_a} → {run_b}){RST}")
-
-    if total_changes == 0:
-        w.p(f"  {DIM}No parameter changes between runs.{RST}")
-        return
-
-    name_a = run_a[:10]
-    name_b = run_b[:10]
-
-    # header row
-    w.p(f"  {'Parameter':<38}  {'Baseline':<20}  {'New':<20}")
-    w.p("  " + "-"*80)
-
-    def _row(key, va, vb, action):
-        cat = _param_category(key)
-        kc = f"{R}{B}" if cat == "TIMING" else (Y if action == "changed" else G if action == "added" else R)
-        if action == "changed":
-            w.p(f"  {kc}{key:<38}{RST}  {DIM}{va:<20}{RST}  {G}{vb:<20}{RST}")
-        elif action == "added":
-            w.p(f"  {kc}{key:<38}{RST}  {DIM}{'(not set)':<20}{RST}  {G}{vb:<20}{RST}")
-        elif action == "removed":
-            w.p(f"  {kc}{key:<38}{RST}  {DIM}{va:<20}{RST}  {R}{'(removed)':<20}{RST}")
-
-    # group by category for readability
-    all_rows = (
-        [(k, va, vb, "changed")  for k,va,vb in changed] +
-        [(k, "",  v,  "added")   for k,v    in added]   +
-        [(k, v,   "",  "removed") for k,v    in removed]
-    )
-    for cat_label in ["TIMING", "FLOORPLAN", "ROUTING", "OTHER"]:
-        rows = [(k,va,vb,act) for k,va,vb,act in all_rows
-                if _param_category(k) == cat_label]
-        if rows:
-            for k,va,vb,act in rows:
-                _row(k, va, vb, act)
-
-    # summary line
-    timing_count = sum(1 for k,*_ in all_rows if _param_category(k) == "TIMING")
-    parts = []
-    if changed: parts.append(f"{Y}{len(changed)} changed{RST}")
-    if added:   parts.append(f"{G}{len(added)} added{RST}")
-    if removed: parts.append(f"{R}{len(removed)} removed{RST}")
-    w.p(f"\n  {DIM}Config summary:{RST}  " + "  ".join(parts))
-    if timing_count:
-        w.p(f"  {R}{B}⚠  {timing_count} timing-critical parameter(s) changed "
-            f"— slack deltas may reflect constraint change, not just implementation.{RST}")
-
-# ── comparison print ──────────────────────────────────────────────────────────
-def _delta(a, b, higher_is_better=True, fmt=None, show_was=False):
+def _delta(a, b, higher_is_better=True, fmt=None):
     if a is None or b is None:
         return DIM + "(N/A)" + RST
     if isinstance(a, float) or isinstance(b, float):
         diff = b - a
-        if fmt == 'area':
-            ds = f"{diff:+.4f}"
-            val_s = f"({ds})"
-        elif fmt == 'float':
-            ds = f"{diff:+.3f}"
-            val_s = f"({ds})"
-        else:
-            ds = f"{diff:+.1f}"
-            val_s = f"({ds})"
-        if diff == 0:
-            return DIM + "(no change)" + RST
+        if fmt == 'area':  ds = f"{diff:+.4f}"
+        elif fmt == 'float': ds = f"{diff:+.3f}"
+        else: ds = f"{diff:+.1f}"
+        if diff == 0: return DIM + "(no change)" + RST
         color = G if (diff > 0) == higher_is_better else R
-        return color + val_s + RST
+        return color + f"({ds})" + RST
     elif isinstance(a, int) and isinstance(b, int):
         diff = b - a
-        if diff == 0:
-            return DIM + "(no change)" + RST
-        color = G if (diff < 0) == (not higher_is_better) else R
-        if higher_is_better:
-            color = G if diff > 0 else R
-        else:
-            color = G if diff < 0 else R
+        if diff == 0: return DIM + "(no change)" + RST
+        color = G if (diff > 0) == higher_is_better else R
         return color + f"({diff:+d})" + RST
     else:
-        if str(a) == str(b):
-            return DIM + "(no change)" + RST
-        if show_was:
-            return Y + f"(was: {a})" + RST
+        if str(a) == str(b): return DIM + "(no change)" + RST
         return Y + f"(was: {a})" + RST
 
-def _strip_ansi(s):
-    return re.sub(r'\x1b\[[0-9;]*m', '', s)
-
-def _row(w, label, va, vb, delta_s, width=30):
+def _row2(w, label, va, vb, delta_s, width=30):
     la = str(va) if va is not None else "N/A"
     lb = str(vb) if vb is not None else "N/A"
-    # pad by visible length so ANSI codes don't break column alignment
     la_pad = la + " " * max(0, 14 - len(_strip_ansi(la)))
     lb_pad = lb + " " * max(0, 14 - len(_strip_ansi(lb)))
     w.p(f"  {label:<{width}}  {la_pad} {lb_pad} {delta_s}")
@@ -413,7 +333,7 @@ def _row(w, label, va, vb, delta_s, width=30):
 def print_comparison(w, run_a, run_b, da, db):
     W = "="*80
     w.p(f"\n{W}")
-    w.p(f"  {B}OpenLane Run Comparison  v2.0{RST}")
+    w.p(f"  {B}OpenLane Run Comparison  v3.0{RST}")
     w.p(f"  Baseline : {C}{run_a}{RST}")
     w.p(f"  Compare  : {C}{run_b}{RST}")
     w.p(W)
@@ -423,75 +343,71 @@ def print_comparison(w, run_a, run_b, da, db):
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
     fs_a = da.get('flow_status','unknown'); fs_b = db.get('flow_status','unknown')
-    _row(w, "Flow status", fs_a, fs_b,
-         DIM+"(no change)"+RST if fs_a==fs_b else Y+f"(was: {fs_a})"+RST)
-    _row(w, "Total runtime",
-         da.get('runtime','N/A'), db.get('runtime','N/A'),
-         Y+f"(was: {da.get('runtime','N/A')})"+RST
-         if da.get('runtime') != db.get('runtime') else DIM+"(no change)"+RST)
+    _row2(w, "Flow status", fs_a, fs_b,
+          DIM+"(no change)"+RST if fs_a==fs_b else Y+f"(was: {fs_a})"+RST)
+    _row2(w, "Total runtime",
+          da.get('runtime','N/A'), db.get('runtime','N/A'),
+          Y+f"(was: {da.get('runtime','N/A')})"+RST
+          if da.get('runtime') != db.get('runtime') else DIM+"(no change)"+RST)
 
     # ANTENNA VIOLATIONS
     w.p(f"\n  {B}-- ANTENNA VIOLATIONS{RST}")
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
-    _row(w, "Pin antenna violations", da.get('pin_ant'), db.get('pin_ant'),
-         _delta(da.get('pin_ant'), db.get('pin_ant'), higher_is_better=False))
-    _row(w, "Net antenna violations", da.get('net_ant'), db.get('net_ant'),
-         _delta(da.get('net_ant'), db.get('net_ant'), higher_is_better=False))
+    _row2(w, "Pin antenna violations", da.get('pin_ant'), db.get('pin_ant'),
+          _delta(da.get('pin_ant'), db.get('pin_ant'), higher_is_better=False))
+    _row2(w, "Net antenna violations", da.get('net_ant'), db.get('net_ant'),
+          _delta(da.get('net_ant'), db.get('net_ant'), higher_is_better=False))
 
     # DRC / LVS
     w.p(f"\n  {B}-- DRC / LVS{RST}")
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
-    _row(w, "Magic DRC violations", da.get('magic_drc'), db.get('magic_drc'),
-         _delta(da.get('magic_drc'), db.get('magic_drc'), higher_is_better=False))
-    _row(w, "TritonRoute violations", da.get('triton_drc'), db.get('triton_drc'),
-         _delta(da.get('triton_drc'), db.get('triton_drc'), higher_is_better=False))
-    _row(w, "Short violations", da.get('shorts'), db.get('shorts'),
-         _delta(da.get('shorts'), db.get('shorts'), higher_is_better=False))
+    _row2(w, "Magic DRC violations", da.get('magic_drc'), db.get('magic_drc'),
+          _delta(da.get('magic_drc'), db.get('magic_drc'), higher_is_better=False))
+    _row2(w, "TritonRoute violations", da.get('triton_drc'), db.get('triton_drc'),
+          _delta(da.get('triton_drc'), db.get('triton_drc'), higher_is_better=False))
+    _row2(w, "Short violations", da.get('shorts'), db.get('shorts'),
+          _delta(da.get('shorts'), db.get('shorts'), higher_is_better=False))
     lvs_a = da.get('lvs','N/A'); lvs_b = db.get('lvs','N/A')
-    _row(w, "LVS status", lvs_a, lvs_b,
-         DIM+"(no change)"+RST if lvs_a==lvs_b else Y+f"(was: {lvs_a})"+RST)
+    _row2(w, "LVS status", lvs_a, lvs_b,
+          DIM+"(no change)"+RST if lvs_a==lvs_b else Y+f"(was: {lvs_a})"+RST)
 
     # TIMING
     w.p(f"\n  {B}-- TIMING  (post-route, RCX -- Typical Corner){RST}")
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
     ss_a = da.get('setup_slack'); ss_b = db.get('setup_slack')
-    hs_a = da.get('hold_slack'); hs_b = db.get('hold_slack')
-    wns_a= da.get('wns',0.0); wns_b= db.get('wns',0.0)
-    tns_a= da.get('tns',0.0); tns_b= db.get('tns',0.0)
+    hs_a = da.get('hold_slack');  hs_b = db.get('hold_slack')
+    wns_a= da.get('wns',0.0);    wns_b= db.get('wns',0.0)
+    tns_a= da.get('tns',0.0);    tns_b= db.get('tns',0.0)
     cp_a = da.get('critical_path'); cp_b = db.get('critical_path')
     ck_a = da.get('clock_period',''); ck_b = db.get('clock_period','')
 
-    _row(w, "Setup slack (ns)",
-         f"{ss_a:.3f}" if ss_a is not None else "N/A",
-         f"{ss_b:.3f}" if ss_b is not None else "N/A",
-         _delta(ss_a, ss_b, higher_is_better=True, fmt='float'))
-    _row(w, "Hold slack  (ns)",
-         f"{hs_a:.3f}" if hs_a is not None else "N/A",
-         f"{hs_b:.3f}" if hs_b is not None else "N/A",
-         _delta(hs_a, hs_b, higher_is_better=True, fmt='float'))
-
+    _row2(w, "Setup slack (ns)",
+          f"{ss_a:.3f}" if ss_a is not None else "N/A",
+          f"{ss_b:.3f}" if ss_b is not None else "N/A",
+          _delta(ss_a, ss_b, higher_is_better=True, fmt='float'))
+    _row2(w, "Hold slack  (ns)",
+          f"{hs_a:.3f}" if hs_a is not None else "N/A",
+          f"{hs_b:.3f}" if hs_b is not None else "N/A",
+          _delta(hs_a, hs_b, higher_is_better=True, fmt='float'))
     wns_both_zero = (wns_a == 0.0 and wns_b == 0.0)
-    wns_delta = DIM+"(no change)"+RST if wns_both_zero else \
-        _delta(wns_a, wns_b, higher_is_better=True, fmt='float')
-    tns_delta = DIM+"(no change)"+RST if (tns_a==0.0 and tns_b==0.0) else \
-        _delta(tns_a, tns_b, higher_is_better=True, fmt='float')
-    _row(w, "WNS  (ns)",
-         DIM+f"{wns_a:.3f}"+RST if wns_both_zero else f"{wns_a:.3f}",
-         DIM+f"{wns_b:.3f}"+RST if wns_both_zero else f"{wns_b:.3f}",
-         wns_delta)
-    _row(w, "TNS  (ns)",
-         DIM+f"{tns_a:.3f}"+RST if (tns_a==0.0 and tns_b==0.0) else f"{tns_a:.3f}",
-         DIM+f"{tns_b:.3f}"+RST if (tns_a==0.0 and tns_b==0.0) else f"{tns_b:.3f}",
-         tns_delta)
-    _row(w, "Critical path (ns)",
-         f"{cp_a:.3f}" if cp_a is not None else "N/A",
-         f"{cp_b:.3f}" if cp_b is not None else "N/A",
-         _delta(cp_a, cp_b, higher_is_better=False, fmt='float'))
-    _row(w, "Clock period (ns)", ck_a or "N/A", ck_b or "N/A",
-         DIM+"(no change)"+RST if ck_a==ck_b else Y+f"(was: {ck_a})"+RST)
+    _row2(w, "WNS  (ns)",
+          DIM+f"{wns_a:.3f}"+RST if wns_both_zero else f"{wns_a:.3f}",
+          DIM+f"{wns_b:.3f}"+RST if wns_both_zero else f"{wns_b:.3f}",
+          DIM+"(no change)"+RST if wns_both_zero else _delta(wns_a, wns_b, higher_is_better=True, fmt='float'))
+    tns_both_zero = (tns_a == 0.0 and tns_b == 0.0)
+    _row2(w, "TNS  (ns)",
+          DIM+f"{tns_a:.3f}"+RST if tns_both_zero else f"{tns_a:.3f}",
+          DIM+f"{tns_b:.3f}"+RST if tns_both_zero else f"{tns_b:.3f}",
+          DIM+"(no change)"+RST if tns_both_zero else _delta(tns_a, tns_b, higher_is_better=True, fmt='float'))
+    _row2(w, "Critical path (ns)",
+          f"{cp_a:.3f}" if cp_a is not None else "N/A",
+          f"{cp_b:.3f}" if cp_b is not None else "N/A",
+          _delta(cp_a, cp_b, higher_is_better=False, fmt='float'))
+    _row2(w, "Clock period (ns)", ck_a or "N/A", ck_b or "N/A",
+          DIM+"(no change)"+RST if ck_a==ck_b else Y+f"(was: {ck_a})"+RST)
 
     # MCMM corners
     corner_defs = [
@@ -506,95 +422,303 @@ def print_comparison(w, run_a, run_b, da, db):
         w.p("  " + "-"*79)
         for key, label in corner_defs:
             ca = da.get(key, {}); cb = db.get(key, {})
-            if not ca and not cb:
-                continue
+            if not ca and not cb: continue
             w.p(f"  {DIM}{label}{RST}")
             setup_a = ca.get('setup'); setup_b = cb.get('setup')
             hold_a  = ca.get('hold');  hold_b  = cb.get('hold')
             wns_a2  = ca.get('wns',0); wns_b2  = cb.get('wns',0)
             tns_a2  = ca.get('tns',0); tns_b2  = cb.get('tns',0)
-            _row(w, "    Setup slack (ns)",
-                 f"{setup_a:.3f}" if setup_a is not None else "N/A",
-                 f"{setup_b:.3f}" if setup_b is not None else "N/A",
-                 _delta(setup_a, setup_b, higher_is_better=True, fmt='float'))
-            _row(w, "    Hold slack  (ns)",
-                 f"{hold_a:.3f}" if hold_a is not None else "N/A",
-                 f"{hold_b:.3f}" if hold_b is not None else "N/A",
-                 _delta(hold_a, hold_b, higher_is_better=True, fmt='float'))
-            _row(w, "    WNS  (ns)",
-                 f"{wns_a2:.3f}", f"{wns_b2:.3f}",
-                 _delta(wns_a2, wns_b2, higher_is_better=True, fmt='float'))
-            _row(w, "    TNS  (ns)",
-                 f"{tns_a2:.3f}", f"{tns_b2:.3f}",
-                 _delta(tns_a2, tns_b2, higher_is_better=True, fmt='float'))
+            _row2(w, "    Setup slack (ns)",
+                  f"{setup_a:.3f}" if setup_a is not None else "N/A",
+                  f"{setup_b:.3f}" if setup_b is not None else "N/A",
+                  _delta(setup_a, setup_b, higher_is_better=True, fmt='float'))
+            _row2(w, "    Hold slack  (ns)",
+                  f"{hold_a:.3f}" if hold_a is not None else "N/A",
+                  f"{hold_b:.3f}" if hold_b is not None else "N/A",
+                  _delta(hold_a, hold_b, higher_is_better=True, fmt='float'))
+            _row2(w, "    WNS  (ns)", f"{wns_a2:.3f}", f"{wns_b2:.3f}",
+                  _delta(wns_a2, wns_b2, higher_is_better=True, fmt='float'))
+            _row2(w, "    TNS  (ns)", f"{tns_a2:.3f}", f"{tns_b2:.3f}",
+                  _delta(tns_a2, tns_b2, higher_is_better=True, fmt='float'))
             slew_a = ca.get('slew'); slew_b = cb.get('slew')
             cap_a  = ca.get('cap');  cap_b  = cb.get('cap')
             fo_a2  = ca.get('fanout'); fo_b2 = cb.get('fanout')
             if any(v is not None for v in [slew_a, slew_b, cap_a, cap_b, fo_a2, fo_b2]):
-                _row(w, "    Slew violations",
-                     str(slew_a) if slew_a is not None else "N/A",
-                     str(slew_b) if slew_b is not None else "N/A",
-                     _delta(slew_a, slew_b, higher_is_better=False))
-                _row(w, "    Cap violations",
-                     str(cap_a) if cap_a is not None else "N/A",
-                     str(cap_b) if cap_b is not None else "N/A",
-                     _delta(cap_a, cap_b, higher_is_better=False))
-                _row(w, "    Fanout violations",
-                     str(fo_a2) if fo_a2 is not None else "N/A",
-                     str(fo_b2) if fo_b2 is not None else "N/A",
-                     _delta(fo_a2, fo_b2, higher_is_better=False))
+                _row2(w, "    Slew violations",
+                      str(slew_a) if slew_a is not None else "N/A",
+                      str(slew_b) if slew_b is not None else "N/A",
+                      _delta(slew_a, slew_b, higher_is_better=False))
+                _row2(w, "    Cap violations",
+                      str(cap_a) if cap_a is not None else "N/A",
+                      str(cap_b) if cap_b is not None else "N/A",
+                      _delta(cap_a, cap_b, higher_is_better=False))
+                _row2(w, "    Fanout violations",
+                      str(fo_a2) if fo_a2 is not None else "N/A",
+                      str(fo_b2) if fo_b2 is not None else "N/A",
+                      _delta(fo_a2, fo_b2, higher_is_better=False))
 
     # SIGNAL INTEGRITY
     w.p(f"\n  {B}-- SIGNAL INTEGRITY VIOLATIONS{RST}")
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
-    _row(w, "Slew violations", da.get('slew_viol'), db.get('slew_viol'),
-         _delta(da.get('slew_viol'), db.get('slew_viol'), higher_is_better=False))
-    _row(w, "Cap violations", da.get('cap_viol'), db.get('cap_viol'),
-         _delta(da.get('cap_viol'), db.get('cap_viol'), higher_is_better=False))
-    _row(w, "Fanout violations", da.get('fanout_viol'), db.get('fanout_viol'),
-         _delta(da.get('fanout_viol'), db.get('fanout_viol'), higher_is_better=False))
+    _row2(w, "Slew violations", da.get('slew_viol'), db.get('slew_viol'),
+          _delta(da.get('slew_viol'), db.get('slew_viol'), higher_is_better=False))
+    _row2(w, "Cap violations", da.get('cap_viol'), db.get('cap_viol'),
+          _delta(da.get('cap_viol'), db.get('cap_viol'), higher_is_better=False))
+    _row2(w, "Fanout violations", da.get('fanout_viol'), db.get('fanout_viol'),
+          _delta(da.get('fanout_viol'), db.get('fanout_viol'), higher_is_better=False))
     fo_a = da.get('max_fanout_constraint',''); fo_b = db.get('max_fanout_constraint','')
-    _row(w, "Max fanout constraint", fo_a or "N/A", fo_b or "N/A",
-         DIM+"(no change)"+RST if fo_a==fo_b else Y+f"(was: {fo_a})"+RST)
+    _row2(w, "Max fanout constraint", fo_a or "N/A", fo_b or "N/A",
+          DIM+"(no change)"+RST if fo_a==fo_b else Y+f"(was: {fo_a})"+RST)
 
     # DESIGN METRICS
     w.p(f"\n  {B}-- DESIGN METRICS{RST}")
     w.p(f"  {'Metric':<30}  {'Baseline':<14} {'New':<14} {'Delta'}")
     w.p("  " + "-"*79)
-    _row(w, "Synth cell count", da.get('synth_cells'), db.get('synth_cells'),
-         _delta(da.get('synth_cells'), db.get('synth_cells'), higher_is_better=False))
-    _row(w, "Total cells", da.get('total_cells'), db.get('total_cells'),
-         _delta(da.get('total_cells'), db.get('total_cells'), higher_is_better=False))
-    _row(w, "Diode cells", da.get('diode_cells'), db.get('diode_cells'),
-         _delta(da.get('diode_cells'), db.get('diode_cells'), higher_is_better=False))
-    _row(w, "Wire length (um)", da.get('wire_length'), db.get('wire_length'),
-         _delta(da.get('wire_length'), db.get('wire_length'), higher_is_better=False))
-    _row(w, "Vias", da.get('vias'), db.get('vias'),
-         _delta(da.get('vias'), db.get('vias'), higher_is_better=False))
+    _row2(w, "Synth cell count", da.get('synth_cells'), db.get('synth_cells'),
+          _delta(da.get('synth_cells'), db.get('synth_cells'), higher_is_better=False))
+    _row2(w, "Total cells", da.get('total_cells'), db.get('total_cells'),
+          _delta(da.get('total_cells'), db.get('total_cells'), higher_is_better=False))
+    _row2(w, "Diode cells", da.get('diode_cells'), db.get('diode_cells'),
+          _delta(da.get('diode_cells'), db.get('diode_cells'), higher_is_better=False))
+    _row2(w, "Wire length (um)", da.get('wire_length'), db.get('wire_length'),
+          _delta(da.get('wire_length'), db.get('wire_length'), higher_is_better=False))
+    _row2(w, "Vias", da.get('vias'), db.get('vias'),
+          _delta(da.get('vias'), db.get('vias'), higher_is_better=False))
     da_a = da.get('die_area'); da_b = db.get('die_area')
-    _row(w, "Die area (mm2)",
-         f"{da_a:.4f}" if da_a is not None else "N/A",
-         f"{da_b:.4f}" if da_b is not None else "N/A",
-         _delta(da_a, da_b, higher_is_better=False, fmt='area'))
+    _row2(w, "Die area (mm2)",
+          f"{da_a:.4f}" if da_a is not None else "N/A",
+          f"{da_b:.4f}" if da_b is not None else "N/A",
+          _delta(da_a, da_b, higher_is_better=False, fmt='area'))
 
-    # legend
     w.p(f"\n{'='*80}")
     w.p(f"  {DIM}Legend : {G}green = improved{RST}  {DIM}{R}red = degraded{RST}  "
         f"{DIM}{Y}yellow = changed{RST}  {DIM}dim = no change / informational{RST}")
     w.p(f"  {DIM}Timing : higher slack = more margin (setup > 0 and hold > 0 = clean){RST}")
     w.p(f"{'='*80}")
 
-# ── fingerprint ───────────────────────────────────────────────────────────────
+# ── v2 config diff ────────────────────────────────────────────────────────────
+def print_config_diff(w, run_a, run_b, path_a, path_b):
+    cfg_a = parse_config(path_a)
+    cfg_b = parse_config(path_b)
+    if not cfg_a and not cfg_b:
+        return
+    changed, added, removed = diff_configs(cfg_a, cfg_b)
+    total_changes = len(changed) + len(added) + len(removed)
+
+    w.p(f"\n  {B}-- CONFIG CHANGES{RST}  {DIM}(config_in.tcl: {run_a} → {run_b}){RST}")
+    if total_changes == 0:
+        w.p(f"  {DIM}No parameter changes between runs.{RST}")
+        return
+
+    w.p(f"  {'Parameter':<38}  {'Baseline':<20}  {'New':<20}")
+    w.p("  " + "-"*80)
+
+    def _cfg_row(key, va, vb, action):
+        cat = _param_category(key)
+        kc = f"{R}{B}" if cat == "TIMING" else (Y if action == "changed" else G if action == "added" else R)
+        if action == "changed":
+            w.p(f"  {kc}{key:<38}{RST}  {DIM}{va:<20}{RST}  {G}{vb:<20}{RST}")
+        elif action == "added":
+            w.p(f"  {kc}{key:<38}{RST}  {DIM}{'(not set)':<20}{RST}  {G}{vb:<20}{RST}")
+        elif action == "removed":
+            w.p(f"  {kc}{key:<38}{RST}  {DIM}{va:<20}{RST}  {R}{'(removed)':<20}{RST}")
+
+    all_rows = (
+        [(k, va, vb, "changed") for k,va,vb in changed] +
+        [(k, "",  v,  "added")  for k,v    in added]   +
+        [(k, v,   "",  "removed") for k,v  in removed]
+    )
+    for cat_label in ["TIMING", "FLOORPLAN", "ROUTING", "OTHER"]:
+        rows = [(k,va,vb,act) for k,va,vb,act in all_rows if _param_category(k) == cat_label]
+        for k,va,vb,act in rows:
+            _cfg_row(k, va, vb, act)
+
+    parts = []
+    if changed: parts.append(f"{Y}{len(changed)} changed{RST}")
+    if added:   parts.append(f"{G}{len(added)} added{RST}")
+    if removed: parts.append(f"{R}{len(removed)} removed{RST}")
+    w.p(f"\n  {DIM}Config summary:{RST}  " + "  ".join(parts))
+    timing_count = sum(1 for k,*_ in all_rows if _param_category(k) == "TIMING")
+    if timing_count:
+        w.p(f"  {R}{B}⚠  {timing_count} timing-critical parameter(s) changed "
+            f"— slack deltas may reflect constraint change, not just implementation.{RST}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3 — multi-run sweep table (3-5 runs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+LABEL_W = 32  # width of metric label column
+_COL_W  = 14  # default; overridden per-call by auto-sizing
+
+def _col_w(runs):
+    """Auto-size column width to the longest run name (min 10, max 22)."""
+    return max(10, min(22, max(len(r) for r in runs) + 2))
+
+def _trunc(s, w):
+    """Truncate string to w chars, appending … if cut."""
+    s = str(s) if s is not None else "N/A"
+    if len(s) <= w:
+        return s
+    return s[:w-1] + "…"
+
+def _cell(v, cw):
+    """Format a single table cell, padded to width cw."""
+    s = _trunc(v, cw)
+    return s + " " * max(0, cw - len(_strip_ansi(s)))
+
+def _hdr_line(runs, cw):
+    """Build the header row: blank label + run names."""
+    hdr = " " * LABEL_W + "  "
+    for r in runs:
+        name = _trunc(r, cw)
+        hdr += (name + " " * max(0, cw - len(name))) + " "
+    return hdr
+
+def _sep(runs, cw):
+    return "-" * (LABEL_W + 2 + (cw + 1) * len(runs))
+
+def _trow(w, label, values, cw):
+    """Print one metric row across all runs."""
+    line = f"  {label:<{LABEL_W}}"
+    for v in values:
+        line += "  " + _cell(v, cw)
+    w.p(line)
+
+def print_sweep_report(w, runs, data):
+    """Multi-run parametric sweep — report view."""
+    n  = len(runs)
+    cw = _col_w(runs)
+    W  = "=" * (LABEL_W + 2 + (cw + 1) * n + 4)
+    w.p(f"\n{W}")
+    w.p(f"  {B}OpenLane Parametric Sweep  v3.0{RST}  {DIM}({n} runs){RST}")
+    w.p(W)
+    w.p("  " + _hdr_line(runs, cw))
+    w.p("  " + _sep(runs, cw))
+
+    # FLOW STATUS
+    w.p(f"\n  {B}-- FLOW STATUS{RST}")
+    _trow(w, "Flow status",   [d.get('flow_status','N/A') for d in data], cw)
+    _trow(w, "Total runtime", [d.get('runtime','N/A')     for d in data], cw)
+
+    # ANTENNA
+    w.p(f"\n  {B}-- ANTENNA VIOLATIONS{RST}")
+    _trow(w, "Pin antenna violations", [d.get('pin_ant') for d in data], cw)
+    _trow(w, "Net antenna violations", [d.get('net_ant') for d in data], cw)
+
+    # DRC / LVS
+    w.p(f"\n  {B}-- DRC / LVS{RST}")
+    _trow(w, "Magic DRC violations",   [d.get('magic_drc')  for d in data], cw)
+    _trow(w, "TritonRoute violations", [d.get('triton_drc') for d in data], cw)
+    _trow(w, "Short violations",       [d.get('shorts')     for d in data], cw)
+    _trow(w, "LVS status",             [d.get('lvs','N/A')  for d in data], cw)
+
+    # TIMING — typical corner
+    w.p(f"\n  {B}-- TIMING  (post-route, RCX -- Typical Corner){RST}")
+    _trow(w, "Clock period (ns)",
+          [d.get('clock_period','N/A') for d in data], cw)
+    _trow(w, "Setup slack (ns)",
+          [f"{d['setup_slack']:.3f}" if d.get('setup_slack') is not None else "N/A" for d in data], cw)
+    _trow(w, "Hold slack (ns)",
+          [f"{d['hold_slack']:.3f}"  if d.get('hold_slack')  is not None else "N/A" for d in data], cw)
+    _trow(w, "WNS (ns)",
+          [f"{d.get('wns',0.0):.3f}" for d in data], cw)
+    _trow(w, "TNS (ns)",
+          [f"{d.get('tns',0.0):.3f}" for d in data], cw)
+    _trow(w, "Critical path (ns)",
+          [f"{d['critical_path']:.3f}" if d.get('critical_path') is not None else "N/A" for d in data], cw)
+
+    # MCMM corners
+    corner_defs = [
+        ('corner_min', 'Min (rcx_min -- best RC)'),
+        ('corner_nom', 'Nom (rcx_nom -- nominal RC)'),
+        ('corner_max', 'Max (rcx_max -- worst RC)'),
+    ]
+    has_mcmm = any(d.get(k) for d in data for k,_ in corner_defs)
+    if has_mcmm:
+        w.p(f"\n  {B}-- TIMING  (MCMM corners){RST}")
+        for ckey, clabel in corner_defs:
+            if not any(d.get(ckey) for d in data):
+                continue
+            w.p(f"\n  {DIM}{clabel}{RST}")
+            _trow(w, "    Setup slack (ns)",
+                  [f"{d[ckey]['setup']:.3f}" if d.get(ckey,{}).get('setup') is not None else "N/A" for d in data], cw)
+            _trow(w, "    Hold slack (ns)",
+                  [f"{d[ckey]['hold']:.3f}"  if d.get(ckey,{}).get('hold')  is not None else "N/A" for d in data], cw)
+            _trow(w, "    WNS (ns)",
+                  [f"{d.get(ckey,{}).get('wns',0):.3f}" for d in data], cw)
+            _trow(w, "    TNS (ns)",
+                  [f"{d.get(ckey,{}).get('tns',0):.3f}" for d in data], cw)
+            _trow(w, "    Slew violations",
+                  [d.get(ckey,{}).get('slew','N/A') for d in data], cw)
+            _trow(w, "    Cap violations",
+                  [d.get(ckey,{}).get('cap','N/A')  for d in data], cw)
+            _trow(w, "    Fanout violations",
+                  [d.get(ckey,{}).get('fanout','N/A') for d in data], cw)
+
+    # SIGNAL INTEGRITY
+    w.p(f"\n  {B}-- SIGNAL INTEGRITY VIOLATIONS{RST}")
+    _trow(w, "Slew violations",      [d.get('slew_viol')   for d in data], cw)
+    _trow(w, "Cap violations",       [d.get('cap_viol')    for d in data], cw)
+    _trow(w, "Fanout violations",    [d.get('fanout_viol') for d in data], cw)
+    _trow(w, "Max fanout constraint",[d.get('max_fanout_constraint','N/A') for d in data], cw)
+
+    # DESIGN METRICS
+    w.p(f"\n  {B}-- DESIGN METRICS{RST}")
+    _trow(w, "Synth cell count", [d.get('synth_cells') for d in data], cw)
+    _trow(w, "Total cells",      [d.get('total_cells') for d in data], cw)
+    _trow(w, "Diode cells",      [d.get('diode_cells') for d in data], cw)
+    _trow(w, "Wire length (um)", [d.get('wire_length') for d in data], cw)
+    _trow(w, "Vias",             [d.get('vias')        for d in data], cw)
+    _trow(w, "Die area (mm2)",
+          [f"{d['die_area']:.4f}" if d.get('die_area') is not None else "N/A" for d in data], cw)
+
+    w.p(f"\n{W}")
+
+def print_sweep_config(w, runs, paths):
+    """Multi-run parametric sweep — config view."""
+    n  = len(runs)
+    cw = _col_w(runs)
+    W  = "=" * (LABEL_W + 2 + (cw + 1) * n + 4)
+    w.p(f"\n{W}")
+    w.p(f"  {B}OpenLane Parametric Sweep — Config  v3.0{RST}  {DIM}({n} runs){RST}")
+    w.p(W)
+
+    configs = [parse_config(p) for p in paths]
+    all_keys = sorted(set(k for cfg in configs for k in cfg))
+
+    if not all_keys:
+        w.p(f"  {DIM}No config_in.tcl found in any run.{RST}")
+        return
+
+    w.p("  " + _hdr_line(runs, cw))
+    w.p("  " + _sep(runs, cw))
+
+    for cat_label in ["TIMING", "FLOORPLAN", "ROUTING", "OTHER"]:
+        keys = [k for k in all_keys if _param_category(k) == cat_label]
+        if not keys:
+            continue
+        w.p(f"\n  {B}-- {cat_label}{RST}")
+        for k in keys:
+            kc = f"{R}{B}" if cat_label == "TIMING" else ""
+            values = [cfg.get(k, "(not set)") for cfg in configs]
+            line = f"  {kc}{k:<{LABEL_W}}{RST}"
+            for v in values:
+                line += "  " + _cell(v, cw)
+            w.p(line)
+
+    w.p(f"\n{W}")
+
+# ── fingerprint (v2 only) ─────────────────────────────────────────────────────
 def _ant_severity(ratio: float) -> str:
     if ratio > 2.5: return "SEVERE"
     if ratio > 1.5: return "MODERATE"
     return "MILD"
 
 def _ant_remedy(ratio, layer, pin, cell_type, cell_map) -> list:
-    sev   = _ant_severity(ratio)
-    tips  = []
-    cell  = cell_map.get(pin.split('/')[0], cell_type or "")
+    sev  = _ant_severity(ratio)
+    tips = []
+    cell = cell_map.get(pin.split('/')[0], cell_type or "")
     if sev == "SEVERE":
         tips.append(f"SEVERE ({ratio:.2f}x) -- Break net before {pin}; "
                     "insert sky130_fd_sc_hd__buf_2 and add DIODE_INSERTION_STRATEGY=4")
@@ -604,40 +728,20 @@ def _ant_remedy(ratio, layer, pin, cell_type, cell_map) -> list:
     else:
         tips.append(f"MILD ({ratio:.2f}x) -- Insert diode at pin {pin} "
                     "to bleed off charge (DIODE_INSERTION_STRATEGY=3 or 4)")
-
     if layer == "met1":
         tips.append("met1 tightest antenna rules in sky130 -- move to met2 sooner, "
                     "or reduce met1 usage via GRT_LAYER_ADJUSTMENTS")
     elif layer in ("met2","met3"):
         tips.append(f"{layer} moderate rules -- break net at this layer with buffer insertion")
-
     if "mux" in cell.lower():
-        tips.append(f"MUX cell ({cell}) -- insert buf_2 before select input; "
-                    "MUX antenna accumulates on both data and select paths")
+        tips.append(f"MUX cell ({cell}) -- insert buf_2 before select input")
     elif "dff" in cell.lower() or "dfxtp" in cell.lower() or "sdff" in cell.lower():
-        tips.append(f"Flip-flop ({cell}) -- add jumper diode on D-input; "
-                    "flop D is high-impedance during antenna accumulation window")
+        tips.append(f"Flip-flop ({cell}) -- add jumper diode on D-input")
     elif "buf" in cell.lower() or "clkbuf" in cell.lower():
-        tips.append(f"Buffer/clkbuf ({cell}) -- safe to break net here; "
-                    "replace with buf_8 for better drive strength")
+        tips.append(f"Buffer/clkbuf ({cell}) -- safe to break net here")
     elif cell:
-        tips.append(f"Logic gate ({cell}) -- safe to break net before this gate; "
-                    "insert sky130_fd_sc_hd__buf_2 to split antenna accumulation")
+        tips.append(f"Logic gate ({cell}) -- safe to break net before this gate")
     return tips
-
-def _fo_severity(slack: int) -> str:
-    if slack <= -16: return "SEVERE"
-    if slack <= -8:  return "MODERATE"
-    return "MILD"
-
-def _fo_category(pin: str) -> str:
-    p = pin.lower()
-    if "/q" in p: return "flop"
-    if p.startswith("wire"): return "wire"
-    if p.startswith("fanout"): return "fanout"
-    if p.startswith("max_length"): return "wire"
-    if p.startswith("load_slew"): return "wire"
-    return "logic"
 
 def fingerprint_antenna(da, db):
     nets_a = da.get('ant_nets', {}); nets_b = db.get('ant_nets', {})
@@ -656,24 +760,6 @@ def fingerprint_antenna(da, db):
                 persistent.append(nets_b[k])
     return fixed, new_viol, worsened, persistent
 
-def fingerprint_fanout(da, db):
-    pins_a = da.get('fanout_pins', {}); pins_b = db.get('fanout_pins', {})
-    all_pins = set(pins_a) | set(pins_b)
-    fixed, new_viol, worsened, persistent = [], [], [], []
-    for p in all_pins:
-        if p in pins_a and p not in pins_b:
-            fixed.append(pins_a[p])
-        elif p not in pins_a and p in pins_b:
-            new_viol.append({**pins_b[p], 'pin': p})
-        else:
-            sa = pins_a[p]['slack']; sb = pins_b[p]['slack']
-            if sb < sa - 2:
-                worsened.append({**pins_b[p], 'pin': p, 'prev_slack': sa})
-            else:
-                persistent.append({**pins_b[p], 'pin': p})
-    return fixed, new_viol, worsened, persistent
-
-
 def print_fingerprint(w, run_a, run_b, da, db):
     W2 = "="*90
     w.p(f"\n{W2}")
@@ -684,13 +770,11 @@ def print_fingerprint(w, run_a, run_b, da, db):
     fixed_a, new_a, worsened_a, persistent_a = fingerprint_antenna(da, db)
     cell_map_b = db.get('cell_map', {})
 
-    # ── summary line ─────────────────────────────────────────────────────────
     w.p(f"\n  {G}OK {len(fixed_a)} fixed{RST}    "
         f"{R}XX {len(new_a)} new{RST}    "
         f"{Y}UP {len(worsened_a)} worsened{RST}    "
         f"{'!! ' + str(len(persistent_a)) + ' persistent' if persistent_a else DIM + '!! 0 persistent' + RST}")
 
-    # ── FIXED ─────────────────────────────────────────────────────────────────
     if fixed_a:
         w.p(f"\n  {DIM}-- FIXED ({len(fixed_a)}) -- these nets were resolved in {run_b}{RST}")
         for v in fixed_a:
@@ -700,41 +784,33 @@ def print_fingerprint(w, run_a, run_b, da, db):
                 f"Pin: {C}{v['pin']:<25}{RST}  "
                 f"Layer: {v['layer']}   Ratio: {v['ratio']:.2f}x{cell_s}")
 
-    # ── NEW ───────────────────────────────────────────────────────────────────
     if new_a:
         w.p(f"\n  {R}-- NEW ({len(new_a)}) -- these violations appeared in {run_b}{RST}")
         for v in new_a:
-            net = v['net']; pin = v['pin']
-            layer = v['layer']; ratio = v['ratio']
-            sev = _ant_severity(ratio)
-            cell = cell_map_b.get(pin.split('/')[0], "")
+            sev = _ant_severity(v['ratio'])
+            cell = cell_map_b.get(v['pin'].split('/')[0], "")
             cell_s = f"  ({cell})" if cell else ""
             sev_color = R if sev=="SEVERE" else Y if sev=="MODERATE" else G
-            w.p(f"  {R}NEW{RST}  Net: {C}{net:<20}{RST}  "
-                f"Pin: {C}{pin:<25}{RST}  "
-                f"Layer: {layer}   Ratio: {sev_color}{ratio:.2f}x  [{sev}]{RST}{cell_s}")
-            for tip in _ant_remedy(ratio, layer, pin, cell, cell_map_b):
+            w.p(f"  {R}NEW{RST}  Net: {C}{v['net']:<20}{RST}  "
+                f"Pin: {C}{v['pin']:<25}{RST}  "
+                f"Layer: {v['layer']}   Ratio: {sev_color}{v['ratio']:.2f}x  [{sev}]{RST}{cell_s}")
+            for tip in _ant_remedy(v['ratio'], v['layer'], v['pin'], cell, cell_map_b):
                 w.p(f"      -> {tip}")
 
-    # ── WORSENED ──────────────────────────────────────────────────────────────
     if worsened_a:
         w.p(f"\n  {Y}-- WORSENED ({len(worsened_a)}) -- ratio increased in {run_b}{RST}")
         for v in worsened_a:
-            net = v['net']; pin = v['pin']
-            layer = v['layer']; ratio = v['ratio']
-            prev = v.get('prev_ratio', 0)
-            sev = _ant_severity(ratio)
-            cell = cell_map_b.get(pin.split('/')[0], "")
+            sev = _ant_severity(v['ratio'])
+            cell = cell_map_b.get(v['pin'].split('/')[0], "")
             cell_s = f"  ({cell})" if cell else ""
             sev_color = R if sev=="SEVERE" else Y if sev=="MODERATE" else G
-            w.p(f"  {Y}UP {RST}  Net: {C}{net:<20}{RST}  "
-                f"Pin: {C}{pin:<25}{RST}  "
-                f"Layer: {layer}   Ratio: {sev_color}{ratio:.2f}x  [{sev}]{RST}  "
-                f"{DIM}(was {prev:.2f}x){RST}{cell_s}")
-            for tip in _ant_remedy(ratio, layer, pin, cell, cell_map_b):
+            w.p(f"  {Y}UP {RST}  Net: {C}{v['net']:<20}{RST}  "
+                f"Pin: {C}{v['pin']:<25}{RST}  "
+                f"Layer: {v['layer']}   Ratio: {sev_color}{v['ratio']:.2f}x  [{sev}]{RST}  "
+                f"{DIM}(was {v.get('prev_ratio',0):.2f}x){RST}{cell_s}")
+            for tip in _ant_remedy(v['ratio'], v['layer'], v['pin'], cell, cell_map_b):
                 w.p(f"      -> {tip}")
 
-    # ── PERSISTENT ────────────────────────────────────────────────────────────
     if persistent_a:
         w.p(f"\n  {DIM}-- PERSISTENT ({len(persistent_a)}) -- unchanged in both runs{RST}")
         for v in persistent_a:
@@ -747,50 +823,75 @@ def print_fingerprint(w, run_a, run_b, da, db):
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="Compare two OpenLane physical design runs.")
-    ap.add_argument("run_a", help="Baseline run tag (directory name under runs/)")
-    ap.add_argument("run_b", help="Compare run tag")
+        description="Compare OpenLane physical design runs (2 runs = diff, 3-5 runs = sweep table).")
+    ap.add_argument("runs", nargs="+",
+                    help="Run tag(s) — directory names under runs/. 2 = comparison, 3-5 = sweep.")
     ap.add_argument("--fingerprint", action="store_true",
-                    help="Show violation fingerprint breakdown")
+                    help="(2-run mode only) Show antenna violation fingerprint + remedies")
     ap.add_argument("--config", action="store_true",
-                    help="Show config_in.tcl parameter diff between runs")
+                    help="Show config view instead of report view")
     ap.add_argument("--save", action="store_true",
                     help="Save plain-text report to file")
     ap.add_argument("--runs-dir", default="runs",
                     help="Path to runs directory (default: ./runs)")
     args = ap.parse_args()
 
-    base = Path(args.runs_dir)
-    path_a = base / args.run_a
-    path_b = base / args.run_b
+    if len(args.runs) < 2:
+        print(f"{R}Error: provide at least 2 run tags.{RST}")
+        sys.exit(1)
+    if len(args.runs) > 5:
+        print(f"{R}Error: maximum 5 runs supported.{RST}")
+        sys.exit(1)
 
-    for tag, p in [(args.run_a, path_a), (args.run_b, path_b)]:
+    base  = Path(args.runs_dir)
+    paths = []
+    for tag in args.runs:
+        p = base / tag
         if not p.exists():
             print(f"{R}Error: run directory not found: {p}{RST}")
             sys.exit(1)
+        paths.append(p)
 
-    fname = f"pd_compare_{args.run_a}_vs_{args.run_b}.txt"
+    run_tags = args.runs
+    tag_str  = "_vs_".join(run_tags)
+    fname    = f"pd_compare_{tag_str}.txt"
     w = OutputWriter(args.save, fname)
 
-    da = collect_run_data(path_a)
-    db = collect_run_data(path_b)
+    multi = len(run_tags) > 2
 
-    print_comparison(w, args.run_a, args.run_b, da, db)
+    if multi:
+        # ── 3-5 run sweep mode ────────────────────────────────────────────────
+        if args.fingerprint:
+            print(f"{Y}Note: --fingerprint is not available in sweep mode (3+ runs).{RST}")
 
-    if args.config:
-        print_config_diff(w, args.run_a, args.run_b, path_a, path_b)
+        data = [collect_run_data(p) for p in paths]
 
-    if args.fingerprint:
-        print_fingerprint(w, args.run_a, args.run_b, da, db)
+        if args.config:
+            print_sweep_config(w, run_tags, paths)
+        else:
+            print_sweep_report(w, run_tags, data)
+            w.p(f"\n  {DIM}Tip: re-run with --config to see parameter differences across runs{RST}")
 
-    # contextual tips — only show flags the user hasn't used yet
-    tips = []
-    if not args.fingerprint:
-        tips.append("--fingerprint  for violation breakdown + antenna remedies")
-    if not args.config:
-        tips.append("--config       for config_in.tcl parameter diff")
-    if tips:
-        w.p(f"\n  {DIM}Tip: re-run with " + "  |  ".join(tips) + RST)
+    else:
+        # ── 2-run comparison mode (v2) ────────────────────────────────────────
+        da = collect_run_data(paths[0])
+        db = collect_run_data(paths[1])
+
+        if args.config:
+            print_config_diff(w, run_tags[0], run_tags[1], paths[0], paths[1])
+        else:
+            print_comparison(w, run_tags[0], run_tags[1], da, db)
+
+            if args.fingerprint:
+                print_fingerprint(w, run_tags[0], run_tags[1], da, db)
+
+            tips = []
+            if not args.fingerprint:
+                tips.append("--fingerprint  for violation breakdown + antenna remedies")
+            if not args.config:
+                tips.append("--config       for config_in.tcl parameter diff")
+            if tips:
+                w.p(f"\n  {DIM}Tip: re-run with " + "  |  ".join(tips) + RST)
 
     w.flush()
 
