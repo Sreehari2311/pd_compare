@@ -7,7 +7,7 @@ Built for engineers who run multiple SDC/config iterations and need a fast, stru
 
 ## What it does
 
-Given two OpenLane run tags, `pd_compare` parses all relevant report files and produces a structured side-by-side comparison across:
+Given two or more OpenLane run tags, `pd_compare` parses all relevant report files and produces a structured comparison across:
 
 - Flow status and runtime
 - Antenna violations (pin and net) with FIXED / NEW / WORSENED / PERSISTENT fingerprinting
@@ -16,19 +16,33 @@ Given two OpenLane run tags, `pd_compare` parses all relevant report files and p
 - Multi-corner timing (MCMM) — min, nom, and max RC corners with setup/hold slack, WNS, TNS
 - Signal integrity — slew, cap, fanout violation counts per corner
 - Design metrics — cell count, wire length, vias, die area
-- Config diff — every parameter added, removed, or changed between runs
+- Config view — every parameter across runs, grouped by category
+
+---
+
+## Modes
+
+| Runs | Mode |
+|---|---|
+| 2 runs | Side-by-side diff with deltas and color coding |
+| 3–5 runs | Parametric sweep table — all runs side by side, no deltas |
+
+Mode is auto-detected from the number of arguments. No flag needed.
 
 ---
 
 ## Installation
 
 ```bash
+git clone https://github.com/Sreehari2311/pd_compare.git
 mkdir -p ~/tools
-cp pd_compare.py ~/tools/pd_compare
+cp pd_compare/pd_compare.py ~/tools/pd_compare
 chmod +x ~/tools/pd_compare
 echo 'export PATH="$HOME/tools:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
+
+No dependencies beyond the Python standard library.
 
 ---
 
@@ -38,7 +52,7 @@ source ~/.bashrc
 # cd into your design directory first
 cd ~/ic_design/OpenLane/designs/picorv32
 
-# Basic comparison
+# 2-run comparison
 pd_compare run1 fan_out_clean_3
 
 # With per-net violation fingerprinting and remedies
@@ -47,9 +61,29 @@ pd_compare run1 fan_out_clean_3 --fingerprint
 # With config diff
 pd_compare run1 fan_out_clean_3 --config
 
-# Explicit design (from anywhere)
-pd_compare picorv32 run1 fan_out_clean_3
+# Parametric sweep — 3 to 5 runs
+pd_compare util_30 util_35 util_40 util_45 util_50
+
+# Config view across all sweep runs
+pd_compare util_30 util_35 util_40 util_45 util_50 --config
+
+# Save report to file
+pd_compare run1 run2 --save
+
+# Runs directory not at ./runs
+pd_compare run1 run2 --runs-dir /path/to/runs
 ```
+
+---
+
+## Flags
+
+| Flag | What it does |
+|---|---|
+| `--fingerprint `     | (2-run only) Classifies every antenna violation as FIXED / NEW / WORSENED / PERSISTENT with per-net detail and remedy suggestions |
+| `--config` | Shows config parameters across runs grouped by TIMING / FLOORPLAN / ROUTING / OTHER |
+| `--save` | Saves plain-text report to `pd_compare_<tags>.txt` |
+| `--runs-dir` | Path to runs directory (default: `./runs`) |
 
 ---
 
@@ -66,18 +100,9 @@ pd_compare reads directly from OpenLane's output report structure:
 | `reports/signoff/*rcx_*_sta.checks.rpt` | Slew, cap, fanout violation counts per corner |
 | `reports/signoff/*antenna_violators.rpt` | Per-net antenna violation details |
 | `logs/signoff/*arc.log` | Cell type enrichment for each violating pin |
-| `config.json` | Config parameter diff between runs |
+| `config_in.tcl` | Config parameters per run |
 
 File names are matched with glob patterns so any OpenLane step-number prefix is handled automatically.
-
----
-
-## Flags
-
-| Flag | What it does |
-|---|---|
-| `--fingerprint` | Classifies every antenna violation as FIXED / NEW / WORSENED / PERSISTENT with per-net detail and remedy suggestions |
-| `--config` | Shows a side-by-side diff of every config parameter that changed between runs |
 
 ---
 
@@ -93,30 +118,20 @@ The `--fingerprint` mode classifies each antenna violation by:
 
 ## Tested on
 
-- OpenLane 1 (Makefile-based)
+- OpenLane 1 (Makefile-based, Docker and native)
 - sky130A PDK (sky130_fd_sc_hd)
 - Designs: picorv32, softmax_top
 
 ---
 
 ## Sample output
-<img width="2359" height="1502" alt="Screenshot 2026-10-30 170440" src="https://github.com/user-attachments/assets/cddd7ba3-b7d9-4035-9269-31a5e3c043b2" />
-<img width="1609" height="1090" alt="Screenshot 2026-10-29 100310" src="https://github.com/user-attachments/assets/be846014-1a76-484a-b02a-82f5677cdbba" />
-<img width="1593" height="1139" alt="Screenshot 2026-10-29 100350" src="https://github.com/user-attachments/assets/67ec7440-4e37-4b6e-844b-29b056677319" />
+
+
+<img width="1649" height="1564" alt="Screenshot 2026-11-02 234703" src="https://github.com/user-attachments/assets/1a2a2649-22d8-4880-b829-12ddac090d98" />
+
+<img width="1868" height="836" alt="Screenshot 2026-11-02 234835" src="https://github.com/user-attachments/assets/e55c679a-0ccb-4ef7-899e-b5d5a536b191" />
+
 
 
 
 ---
-
-## Roadmap
-
-**v3 — Multi-run comparison**
-- `pd_compare run1 run2 run3` — compare 3+ runs in one table
-- Useful for parameter sweeps where you need to see the trend across iterations, not just A vs B
-
-**Future**
-- Power breakdown (internal / switching / leakage per corner)
-- IR drop comparison (VPWR / VGND)
-- Pre-violation margin warnings (nets at 80–90% of antenna limit)
-- Clock tree analysis (skew, insertion delay, buffer depth)
-- `--save` to export report to file
